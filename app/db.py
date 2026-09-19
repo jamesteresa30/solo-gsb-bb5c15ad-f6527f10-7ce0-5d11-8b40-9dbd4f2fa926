@@ -48,6 +48,30 @@ CREATE TABLE IF NOT EXISTS dispatch_cursors (
     updated_at       TEXT NOT NULL
 );
 
+-- 交付凭证：为已 finalized 的会话签发的一次性清单领取凭证。
+-- 只保存随机 token 的 SHA-256（明文 token 仅在签发响应中出现一次，不落库）、
+-- 所属会话、到期时间与状态：active（未消费）| consumed（已领取）| revoked（已撤销）
+CREATE TABLE IF NOT EXISTS delivery_tickets (
+    token_hash   TEXT PRIMARY KEY,                        -- 随机 token 的 SHA-256（小写十六进制）
+    session_id   TEXT NOT NULL REFERENCES sessions(id),
+    expires_at   TEXT NOT NULL,
+    status       TEXT NOT NULL DEFAULT 'active'
+);
+
+CREATE INDEX IF NOT EXISTS idx_delivery_tickets_session ON delivery_tickets(session_id);
+
+-- 交付凭证兑换幂等记录：(凭证, request_id) 唯一。
+-- 首次成功兑换时落库完整响应 JSON：同一 request_id 重放原样返回首次结果；
+-- 不同 request_id 的并发兑换经条件更新串行化，仅一个能把 active 置为 consumed
+CREATE TABLE IF NOT EXISTS delivery_ticket_redemptions (
+    token_hash     TEXT NOT NULL REFERENCES delivery_tickets(token_hash),
+    request_id     TEXT NOT NULL,
+    session_id     TEXT NOT NULL,
+    response_json  TEXT NOT NULL,                         -- 首次成功兑换响应的完整 JSON
+    redeemed_at    TEXT NOT NULL,
+    PRIMARY KEY (token_hash, request_id)
+);
+
 CREATE TABLE IF NOT EXISTS chunks (
     session_id        TEXT NOT NULL REFERENCES sessions(id),
     chunk_index       INTEGER NOT NULL,
@@ -145,6 +169,34 @@ CREATE TABLE dispatch_cursors (
     queue_key        TEXT PRIMARY KEY,
     last_session_id  TEXT NOT NULL,
     updated_at       TEXT NOT NULL
+)
+        """,
+    ),
+    # 0008: 一次性交付凭证表；旧库直接按当前定义新建，凭证在签发时惰性写入
+    (
+        "table",
+        "delivery_tickets",
+        """
+CREATE TABLE delivery_tickets (
+    token_hash   TEXT PRIMARY KEY,
+    session_id   TEXT NOT NULL REFERENCES sessions(id),
+    expires_at   TEXT NOT NULL,
+    status       TEXT NOT NULL DEFAULT 'active'
+)
+        """,
+    ),
+    # 0009: 交付凭证兑换幂等记录表；旧库直接按当前定义新建，首次成功兑换时惰性写入
+    (
+        "table",
+        "delivery_ticket_redemptions",
+        """
+CREATE TABLE delivery_ticket_redemptions (
+    token_hash     TEXT NOT NULL REFERENCES delivery_tickets(token_hash),
+    request_id     TEXT NOT NULL,
+    session_id     TEXT NOT NULL,
+    response_json  TEXT NOT NULL,
+    redeemed_at    TEXT NOT NULL,
+    PRIMARY KEY (token_hash, request_id)
 )
         """,
     ),

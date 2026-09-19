@@ -383,6 +383,70 @@ class FinalizeResponse(BaseModel):
     finalized_at: datetime
 
 
+# 交付凭证兑换失败原因（detail.reason）：
+# - ticket_revoked：凭证已撤销
+# - ticket_consumed：凭证已被另一个 request_id 消费
+# - ticket_expired：凭证已过期
+TICKET_REASON_REVOKED = "ticket_revoked"
+TICKET_REASON_CONSUMED = "ticket_consumed"
+TICKET_REASON_EXPIRED = "ticket_expired"
+
+
+class DeliveryTicketIssueRequest(BaseModel):
+    expires_in_seconds: int = Field(
+        ge=1,
+        description="凭证有效期（秒），须为正整数；超过服务端上限"
+                    " DEFAULT_DELIVERY_TICKET_MAX_TTL_SECONDS（默认 86400）时截断到上限")
+
+
+class DeliveryTicketIssueResponse(BaseModel):
+    ticket_id: str = Field(description="凭证 id（token 的 SHA-256 小写十六进制，与库内主键一致）")
+    session_id: str = Field(description="凭证所属的已提交会话 id")
+    token: str = Field(
+        description="一次性随机领取令牌：仅此响应返回一次，服务端只存其 SHA-256，"
+                    "遗失不补；兑换时凭此令牌调用 POST /delivery-tickets/redeem")
+    status: str = Field(description="凭证状态：签发时始终为 active")
+    expires_at: datetime = Field(description="凭证到期时间（UTC）；过期后不可领取")
+
+
+class DeliveryTicketRedeemRequest(BaseModel):
+    token: str = Field(
+        min_length=1, max_length=256,
+        description="签发响应中一次性返回的随机领取令牌；服务端按其 SHA-256 查找凭证")
+    request_id: str = Field(
+        min_length=1, max_length=128,
+        description="兑换幂等键：同一凭证 + 同一 request_id 的重放返回首次结果；"
+                    "不同 request_id 并发兑换仅一个成功")
+
+
+class DeliveryTicketRedeemResponse(BaseModel):
+    ticket_id: str = Field(description="token 的 SHA-256（小写十六进制）")
+    session_id: str
+    status: str = Field(description="兑换后凭证状态：首次成功时为 consumed")
+    file_digest: str
+    digest_algorithm: str
+    total_chunks: int
+    manifest: list[ManifestEntry] = Field(
+        description="所属会话按分片序号升序的完整清单（与 finalize 返回一致）")
+    redeemed_at: datetime = Field(description="首次成功兑换时间；重放时保持首次值不变")
+    expires_at: datetime
+    idempotent_replay: bool = Field(
+        default=False, description="是否为同一 request_id 的幂等重放（重放返回首次清单）")
+
+
+class DeliveryTicketRevokeRequest(BaseModel):
+    token: str = Field(min_length=1, max_length=256,
+                       description="要撤销凭证的一次性随机领取令牌（按其 SHA-256 定位）")
+
+
+class DeliveryTicketRevokeResponse(BaseModel):
+    ticket_id: str
+    session_id: str
+    status: str = Field(description="撤销后凭证状态：始终为 revoked")
+    expires_at: datetime
+    revoked_at: datetime
+
+
 class ChunkStatus(BaseModel):
     chunk_index: int
     status: str  # pending | leased | completed（过期租约/冷却中的分片按 pending 展示）

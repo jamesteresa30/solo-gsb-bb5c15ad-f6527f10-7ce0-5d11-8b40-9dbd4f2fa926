@@ -10,6 +10,7 @@ services:
       MAX_LEASE_TTL_SECONDS: "3600"
       DEFAULT_BASE_RETRY_SECONDS: "5"
       DEFAULT_MAX_RETRY_SECONDS: "300"
+      DEFAULT_DELIVERY_TICKET_MAX_TTL_SECONDS: "86400"
     volumes:
       - coordinator-data:/data
     restart: unless-stopped
