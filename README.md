@@ -50,6 +50,9 @@ docker compose up --build
 - **批量领取**：`POST /sessions/{id}/leases/batch` 在**同一临界区**内完成资格计算与写入：仅从“未完成、无有效租约（过期租约视为空闲）、**不在退避冷却中**、前置已全部完成”的分片中，按分片序号升序领取，返回各分片独立令牌；并发请求之间不会重复分配、也不会突破并发上限。无可领取项时返回空列表及 `active` / `blocked` / `next_expiry` 汇总，其中 **`next_expiry` 取有效租约最早过期时间与各分片退避最早结束时间中的更早者**。
 - **跨会话公平调度**：`POST /dispatch/lease` 面向多个上传会话组成的调度队列，每次调用从候选会话中**轮转发一片分片租约**。请求携带 `queue_key`（队列标识）、`session_ids`（候选会话列表）与可选 `lease_ttl_seconds`。服务端将候选**去重后按（创建时间, id）稳定排序**，并按 `queue_key` 持久化**最近一次成功发放的会话**作为游标；每次请求在**同一写锁事务**内从游标之后的会话开始**循环扫描**，命中首个“存在可领取分片且仍有并发槽位”的会话后，发放其**序号最低**的可领取分片。资格判定完全复用既有规则：未完成、无有效租约（过期视为空闲）、不在退避冷却中、前置全部完成、会话未提交且未达 `max_active_leases`，因此并发请求**不会重复发放**。**成功后才把游标推进到被发放会话**，连续请求会在可用会话之间轮转；**无可发放项时不推进游标**，响应中 `granted` 为 `null`、`unavailable` 按扫描顺序列出各会话原因（`session_not_found` / `session_finalized` / `session_full` / `chunks_blocked_by_dependencies` / `chunks_in_backoff` / `chunks_leased` / `no_unfinished_chunks`）与各会话的 `next_retry_at`，顶层 `next_retry_at` 取其中最早者。游标所指会话不在本次候选中时，从排序首位重新开始扫描。
 - **提交**：仅当全部分片完成才允许提交，返回按分片序号升序汇总的清单；否则返回 `409` 及 `missing_chunks` 缺失分片列表。重复提交幂等返回同一清单。会话使用 `sha256-merkle-v1` 时，提交前先按分片序号构建 Merkle 树并与 `file_digest` 常量时间比较，不匹配返回 `409` 及 `computed_digest`，会话保持 `active`（见下文「完整性校验」）。
+- **交付凭证（delivery ticket，一次性清单领取）**：已 `finalized` 的会话可通过 `POST /sessions/{id}/delivery-tickets`（携带 `expires_in_seconds`，1～365 天）签发**一次性清单领取凭证**。服务端生成高强度随机令牌（`secrets.token_urlsafe(32)`），**明文令牌仅在签发响应中返回一次**；数据库内**只保存令牌的 SHA-256、所属会话、到期时间与状态**（`active` / `consumed` / `revoked`），明文遗失不可找回。同一会话可签发多张相互独立的凭证；`active`（未提交）会话不能签发（`409`）。
+  - **兑换**：`POST /delivery-tickets/redeem` 携带 `token` 与调用方生成的幂等键 `request_id`，在**同一写事务**内依次校验**未消费、未撤销、未过期**，通过后原子地把凭证置为 `consumed` 并返回该会话**按分片序号升序的 manifest**（与 finalize 清单一致）及 `redeemed_at`。**并发的不同 `request_id` 只有一个成功**（其余 `409 already consumed`）；**同一 `request_id` 的重放（含并发重试）返回与首次完全相同的结果**——首次响应被原样持久化，即使此后凭证已过期或被撤销。已撤销（`409 revoked`）、已过期（`409 expired`）或已被其它 `request_id` 消费（`409 already consumed`）的凭证均不可领取；未知令牌返回 `404`。
+  - **撤销**：`POST /delivery-tickets/revoke` 携带 `token`，将未消费凭证置为 `revoked`（**已消费凭证不可撤销**，返回 `409`；已过期但未消费的凭证仍可撤销）；对已撤销凭证重复撤销幂等成功（`already_revoked: true`）。撤销后任何兑换请求都返回 `409`。
 - 已完成的分片不可再领取租约；已提交的会话进入只读状态。
 
 ## 完整性校验（sha256-merkle-v1，可选）
@@ -129,6 +132,9 @@ curl -s -X POST http://localhost:8000/sessions/$SID/finalize
 | `POST` | `/sessions/{session_id}/chunks/{index}/reopen` | 完成纠错回退（凭完成时的令牌与摘要，原子重置目标及全部传递下游，`revision` 递增 1） |
 | `POST` | `/sessions/{session_id}/chunks/{index}/fail` | 上报分片失败（校验有效租约，原子清除租约并进入指数退避） |
 | `POST` | `/sessions/{session_id}/finalize` | 提交会话，返回按序分片清单（`sha256-merkle-v1` 会话先校验 Merkle 根，不匹配返回 409 及 `computed_digest`） |
+| `POST` | `/sessions/{session_id}/delivery-tickets` | 为已 finalized 会话签发一次性清单领取凭证（明文 token 仅此一次返回，库内只存 SHA-256/会话/到期/状态） |
+| `POST` | `/delivery-tickets/redeem` | 凭 token + 幂等 `request_id` 兑换按序 manifest（一次性；并发不同 request_id 仅一个成功，同 request_id 重放返回首次结果） |
+| `POST` | `/delivery-tickets/revoke` | 撤销未消费凭证（已消费不可撤销；重复撤销幂等，撤销后不可兑换） |
 | `GET` | `/healthz` | 健康检查 |
 
 ## 批量领取与并发上限（curl）
@@ -439,6 +445,68 @@ curl -s http://localhost:8000/sessions/<新会话id>
 # => {"source_session_id": "<源会话id>", "revision": 0, ...}
 ```
 
+## 交付凭证（delivery ticket，curl）
+
+会话提交后，可向**已提交会话**签发一次性的清单领取凭证。凭证明文**只返回一次**，
+数据库内仅保存其 SHA-256、所属会话、到期时间与状态，因此适合把凭证交给只应读取
+一次交付清单的一方（如下游交付系统）；配合 `request_id` 可安全重试。
+
+```bash
+# 前置：会话已 finalize（全部分片完成并通过可选的 Merkle 校验）
+SID=...   # 同前，POST /sessions 创建、逐分片领取/完成后 POST /sessions/$SID/finalize
+
+# 1. 签发凭证：有效期 600 秒；ticket_token 仅此一次返回，请立即保存
+curl -s -X POST http://localhost:8000/sessions/$SID/delivery-tickets \
+  -H 'Content-Type: application/json' -d '{"expires_in_seconds": 600}'
+# => 201 {
+#      "ticket_token": "Rk9...（随机令牌，只展示这一次）",
+#      "session_id": "...", "status": "active",
+#      "expires_at": "2026-...Z", "created_at": "2026-...Z"
+#    }
+TK='<上一步返回的 ticket_token>'
+
+# 2. 兑换：携带调用方生成的幂等键 request_id，返回按分片序号升序的交付清单
+curl -s -X POST http://localhost:8000/delivery-tickets/redeem \
+  -H 'Content-Type: application/json' \
+  -d "{\"token\": \"$TK\", \"request_id\": \"delivery-2026-09-19-001\"}"
+# => 200 {
+#      "session_id": "...", "status": "finalized",
+#      "file_digest": "...", "digest_algorithm": "sha256",
+#      "total_chunks": 4,
+#      "manifest": [
+#        {"chunk_index": 0, "chunk_digest": "...", "completed_at": "2026-..."},
+#        {"chunk_index": 1, "chunk_digest": "...", "completed_at": "2026-..."},
+#        ...
+#      ],
+#      "finalized_at": "2026-...Z",
+#      "redeemed_at": "2026-...Z",
+#      "request_id": "delivery-2026-09-19-001"
+#    }
+
+# 3. 网络重试安全：同一 request_id 重放返回与首次完全相同的结果
+#    （redeemed_at / manifest 均为首次值；即使凭证之后过期或被撤销也一样）
+curl -s -X POST http://localhost:8000/delivery-tickets/redeem \
+  -H 'Content-Type: application/json' \
+  -d "{\"token\": \"$TK\", \"request_id\": \"delivery-2026-09-19-001\"}"
+# => 200（与首次逐字段一致）
+
+# 4. 凭证一次性：不同 request_id 的兑换（含并发请求）只有一个成功
+#    => 409 {"detail": "delivery ticket already consumed"}
+#    过期 => 409 {"detail": "delivery ticket expired"}
+#    撤销 => 409 {"detail": "delivery ticket revoked"}
+#    未知令牌 => 404 {"detail": "delivery ticket not found"}
+
+# 5. 撤销尚未消费的凭证（已消费凭证返回 409；重复撤销幂等）
+curl -s -X POST http://localhost:8000/delivery-tickets/revoke \
+  -H 'Content-Type: application/json' -d "{\"token\": \"$TK2\"}"
+# => 200 {"session_id": "...", "status": "revoked",
+#         "revoked_at": "2026-...Z", "already_revoked": false}
+```
+
+同一会话的多张凭证相互独立：撤销一张不影响其它凭证，各自只能成功兑换一次。
+注意签发与撤销都需要凭证明文；库内无法从 SHA-256 反推出令牌，因此明文丢失后
+只能重新签发（必要时等旧凭证自然过期）。
+
 ## 本地开发（不用 Docker）
 
 ```bash
@@ -460,7 +528,7 @@ app/
   db.py        # SQLite 连接与建库建表（启动时自动执行）
   schemas.py   # Pydantic 请求/响应模型
 tests/
-  test_api.py  # 租约独占/过期、幂等、提交等端到端行为测试
+  test_api.py  # 租约独占/过期、幂等、提交、交付凭证等端到端行为测试
 Dockerfile
 docker-compose.yml
 requirements.txt

@@ -2159,3 +2159,410 @@ def test_migration_adds_dispatch_cursors_to_legacy_database(tmp_path):
     assert cols == {"queue_key", "last_session_id", "updated_at"}
     db.run_migrations(migrated)  # 再次执行幂等不报错
     migrated.close()
+
+
+# ---------------------------------------------------------------- 交付凭证（delivery ticket）
+
+def issue_ticket(session_id, expires_in_seconds=3600):
+    return client.post(
+        f"/sessions/{session_id}/delivery-tickets",
+        json={"expires_in_seconds": expires_in_seconds},
+    )
+
+
+def redeem(ticket_token, request_id):
+    return client.post(
+        "/delivery-tickets/redeem",
+        json={"token": ticket_token, "request_id": request_id},
+    )
+
+
+def revoke(ticket_token):
+    return client.post(
+        "/delivery-tickets/revoke",
+        json={"token": ticket_token},
+    )
+
+
+def finalized_session(total_chunks=3):
+    """创建会话并逐分片领取/完成/提交；返回 (session_id, 期望清单)。"""
+    s = make_session(total_chunks=total_chunks)
+    expected = []
+    for i in range(total_chunks):
+        token = lease(s["id"], i).json()["lease_token"]
+        digest = f"{i:064d}"
+        assert complete(s["id"], i, token, digest).status_code == 200
+        expected.append({"chunk_index": i, "chunk_digest": digest})
+    assert client.post(f"/sessions/{s['id']}/finalize").status_code == 200
+    return s["id"], expected
+
+
+def test_ticket_requires_finalized_session():
+    s = make_session(total_chunks=1)
+    # active 会话不可签发
+    r = issue_ticket(s["id"])
+    assert r.status_code == 409
+    assert "finalized" in r.json()["detail"]
+    # 未知会话 404
+    assert issue_ticket("nope").status_code == 404
+
+    sid, _ = finalized_session(1)
+    ok = issue_ticket(sid, 600)
+    assert ok.status_code == 201, ok.text
+    body = ok.json()
+    assert body["status"] == "active"
+    assert body["session_id"] == sid
+    assert len(body["ticket_token"]) >= 40
+    expires = datetime.fromisoformat(body["expires_at"])
+    created = datetime.fromisoformat(body["created_at"])
+    assert 599 <= (expires - created).total_seconds() <= 600
+    assert expires > datetime.now(timezone.utc)
+
+
+def test_ticket_token_is_shown_once_and_only_hash_persisted():
+    sid, _ = finalized_session(1)
+    body = issue_ticket(sid, 3600).json()
+    token = body["ticket_token"]
+
+    # 明文令牌不出现在任何表中；delivery_tickets 仅保存 SHA-256、会话、到期与状态
+    rows = get_conn().execute(
+        "SELECT * FROM delivery_tickets WHERE session_id = ?", (sid,)
+    ).fetchall()
+    assert len(rows) == 1
+    row = rows[0]
+    assert row.keys() == ["token_hash", "session_id", "expires_at", "status"]
+    assert row["token_hash"] == hashlib.sha256(token.encode()).hexdigest()
+    assert row["status"] == "active"
+
+    found = get_conn().execute(
+        "SELECT COUNT(*) AS n FROM delivery_tickets WHERE token_hash = ?",
+        (token,),
+    ).fetchone()["n"]
+    assert found == 0
+
+
+def test_redeem_returns_ordered_manifest_and_consumes_once():
+    sid, expected = finalized_session(3)
+    token = issue_ticket(sid, 3600).json()["ticket_token"]
+    fin_manifest = client.post(f"/sessions/{sid}/finalize").json()["manifest"]
+
+    r = redeem(token, "req-first")
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["session_id"] == sid
+    assert body["status"] == "finalized"
+    assert body["request_id"] == "req-first"
+    assert body["total_chunks"] == 3
+    assert [m["chunk_index"] for m in body["manifest"]] == [0, 1, 2]
+    assert [{k: m[k] for k in ("chunk_index", "chunk_digest")} for m in body["manifest"]] == expected
+    # 兑换清单与提交清单一致（含 completed_at）
+    assert body["manifest"] == fin_manifest
+    assert datetime.fromisoformat(body["redeemed_at"]) <= datetime.now(timezone.utc)
+
+    # 凭证已消费：不同 request_id 不可再领取
+    r2 = redeem(token, "req-second")
+    assert r2.status_code == 409
+    assert "consumed" in r2.json()["detail"]
+
+    # 库内状态已置 consumed
+    row = get_conn().execute(
+        "SELECT status FROM delivery_tickets WHERE token_hash = ?",
+        (hashlib.sha256(token.encode()).hexdigest(),),
+    ).fetchone()
+    assert row["status"] == "consumed"
+
+
+def test_redeem_same_request_id_replays_identical_result():
+    sid, _ = finalized_session(2)
+    token = issue_ticket(sid, 3600).json()["ticket_token"]
+
+    r1 = redeem(token, "idem-1")
+    assert r1.status_code == 200
+    r2 = redeem(token, "idem-1")
+    assert r2.status_code == 200
+    r3 = redeem(token, "idem-1")
+    assert r3.status_code == 200
+    # 同一 request_id 重放返回首次完全相同的结果
+    assert r2.json() == r1.json()
+    assert r3.json() == r1.json()
+    assert r3.json()["redeemed_at"] == r1.json()["redeemed_at"]
+
+    # 只有一条幂等记录
+    n = get_conn().execute(
+        "SELECT COUNT(*) AS n FROM delivery_ticket_redemptions WHERE request_id = 'idem-1'"
+    ).fetchone()["n"]
+    assert n == 1
+
+    # 不同 request_id 仍然失败（一次性）
+    assert redeem(token, "other").status_code == 409
+
+
+def test_redeem_replay_works_even_after_time_passes_and_expiry():
+    sid, _ = finalized_session(1)
+    token = issue_ticket(sid, 3600).json()["ticket_token"]
+    first = redeem(token, "replay-key")
+    assert first.status_code == 200
+
+    # 凭证已消费且到期时间被改为过去：同 request_id 重放仍返回首次结果
+    get_conn().execute(
+        "UPDATE delivery_tickets SET expires_at = '2000-01-01T00:00:00+00:00'"
+        " WHERE token_hash = ?",
+        (hashlib.sha256(token.encode()).hexdigest(),)
+    )
+    get_conn().commit()
+    again = redeem(token, "replay-key")
+    assert again.status_code == 200
+    assert again.json() == first.json()
+
+
+def test_concurrent_redeems_with_different_request_ids_only_one_succeeds():
+    sid, _ = finalized_session(1)
+    token = issue_ticket(sid, 3600).json()["ticket_token"]
+
+    statuses: list[int] = []
+    bodies: list[dict] = []
+    lock = threading.Lock()
+    barrier = threading.Barrier(8)
+
+    def worker(i):
+        barrier.wait()
+        r = redeem(token, f"race-{i}")
+        with lock:
+            statuses.append(r.status_code)
+            bodies.append(r.json())
+
+    threads = [threading.Thread(target=worker, args=(i,)) for i in range(8)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    assert sorted(statuses).count(200) == 1
+    assert sorted(statuses).count(409) == 7
+    winner = next(b for b in bodies if "manifest" in b)
+    assert [m["chunk_index"] for m in winner["manifest"]] == [0]
+
+    # 获胜 request_id 的重放（含并发结束后）仍返回首次结果
+    replay = redeem(token, winner["request_id"])
+    assert replay.status_code == 200
+    assert replay.json() == winner
+
+
+def test_concurrent_same_request_id_replays_all_get_first_result():
+    sid, _ = finalized_session(1)
+    token = issue_ticket(sid, 3600).json()["ticket_token"]
+
+    results: list[tuple[int, dict]] = []
+    lock = threading.Lock()
+    barrier = threading.Barrier(6)
+
+    def worker():
+        barrier.wait()
+        r = redeem(token, "same-key")
+        with lock:
+            results.append((r.status_code, r.json()))
+
+    threads = [threading.Thread(target=worker) for _ in range(6)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    # 同一 request_id：全部成功且结果完全一致（首个提交者的响应）
+    assert all(code == 200 for code, _ in results)
+    first = results[0][1]
+    assert all(body == first for _, body in results)
+    n = get_conn().execute(
+        "SELECT COUNT(*) AS n FROM delivery_ticket_redemptions"
+        " WHERE request_id = 'same-key'"
+    ).fetchone()["n"]
+    assert n == 1
+
+
+def test_expired_ticket_cannot_redeem_but_another_ticket_still_works():
+    sid, _ = finalized_session(1)
+    stale = issue_ticket(sid, 3600).json()["ticket_token"]
+    fresh = issue_ticket(sid, 600).json()["ticket_token"]
+
+    # 手动让第一张到期
+    get_conn().execute(
+        "UPDATE delivery_tickets SET expires_at = '2000-01-01T00:00:00+00:00'"
+        " WHERE token_hash = ?",
+        (hashlib.sha256(stale.encode()).hexdigest(),)
+    )
+    get_conn().commit()
+
+    r = redeem(stale, "late")
+    assert r.status_code == 409
+    assert "expired" in r.json()["detail"]
+    # 过期但未消费：状态仍是 active（不自动改状态，保持可撤销）
+    row = get_conn().execute(
+        "SELECT status FROM delivery_tickets WHERE token_hash = ?",
+        (hashlib.sha256(stale.encode()).hexdigest(),)
+    ).fetchone()
+    assert row["status"] == "active"
+    # 同一会话的另一张凭证不受影响
+    assert redeem(fresh, "on-time").status_code == 200
+
+
+def test_revoked_ticket_cannot_redeem_and_revoke_is_idempotent():
+    sid, _ = finalized_session(1)
+    token = issue_ticket(sid, 3600).json()["ticket_token"]
+
+    r1 = revoke(token)
+    assert r1.status_code == 200
+    assert r1.json()["status"] == "revoked"
+    assert r1.json()["already_revoked"] is False
+
+    # 重复撤销幂等
+    r2 = revoke(token)
+    assert r2.status_code == 200
+    assert r2.json()["status"] == "revoked"
+    assert r2.json()["already_revoked"] is True
+
+    # 撤销后任何 request_id 都不可领取（包括重放一个从未成功过的键）
+    assert redeem(token, "never-used").status_code == 409
+    assert redeem(token, "another").status_code == 409
+
+
+def test_consumed_ticket_cannot_be_revoked():
+    sid, _ = finalized_session(1)
+    token = issue_ticket(sid, 3600).json()["ticket_token"]
+    assert redeem(token, "keeper").status_code == 200
+
+    r = revoke(token)
+    assert r.status_code == 409
+    assert "consumed" in r.json()["detail"]
+    # 状态保持 consumed；同 request_id 重放仍成功
+    assert redeem(token, "keeper").status_code == 200
+
+
+def test_expired_unconsumed_ticket_can_be_revoked():
+    sid, _ = finalized_session(1)
+    token = issue_ticket(sid, 3600).json()["ticket_token"]
+    get_conn().execute(
+        "UPDATE delivery_tickets SET expires_at = '2000-01-01T00:00:00+00:00'"
+        " WHERE token_hash = ?",
+        (hashlib.sha256(token.encode()).hexdigest(),)
+    )
+    get_conn().commit()
+    assert redeem(token, "x").status_code == 409  # 已过期
+    r = revoke(token)
+    assert r.status_code == 200
+    assert r.json()["status"] == "revoked"
+    assert redeem(token, "x").status_code == 409  # 撤销后依旧不可领取
+
+
+def test_redeem_and_revoke_unknown_token():
+    assert redeem("definitely-not-a-real-token", "r").status_code == 404
+    assert revoke("definitely-not-a-real-token").status_code == 404
+
+
+def test_multiple_tickets_for_one_session_are_independent():
+    sid, _ = finalized_session(1)
+    t1 = issue_ticket(sid, 3600).json()["ticket_token"]
+    t2 = issue_ticket(sid, 3600).json()["ticket_token"]
+    assert t1 != t2
+
+    # 撤销第一张不影响第二张
+    assert revoke(t1).status_code == 200
+    assert redeem(t1, "a").status_code == 409
+    r2 = redeem(t2, "b")
+    assert r2.status_code == 200
+    # 第二张消费后不可再用
+    assert redeem(t2, "c").status_code == 409
+
+    # 同一会话仍可继续签发新凭证
+    t3 = issue_ticket(sid, 60).json()["ticket_token"]
+    assert redeem(t3, "d").status_code == 200
+
+
+def test_delivery_ticket_request_validation():
+    sid, _ = finalized_session(1)
+    # expires_in_seconds 必须为正
+    assert issue_ticket(sid, 0).status_code == 422
+    assert issue_ticket(sid, -5).status_code == 422
+    # 缺字段
+    assert client.post(
+        f"/sessions/{sid}/delivery-tickets", json={}).status_code == 422
+    # 兑换：缺字段 / 空串
+    assert client.post("/delivery-tickets/redeem", json={
+        "request_id": "r"}).status_code == 422
+    assert client.post("/delivery-tickets/redeem", json={
+        "token": "t"}).status_code == 422
+    assert client.post("/delivery-tickets/redeem", json={
+        "token": "", "request_id": "r"}).status_code == 422
+    assert client.post("/delivery-tickets/redeem", json={
+        "token": "t", "request_id": ""}).status_code == 422
+    # 撤销：缺字段 / 空串
+    assert client.post("/delivery-tickets/revoke", json={}).status_code == 422
+    assert client.post("/delivery-tickets/revoke", json={"token": ""}).status_code == 422
+
+
+def test_migration_adds_delivery_ticket_tables_to_legacy_database(tmp_path):
+    import sqlite3
+
+    legacy = tmp_path / "legacy6.db"
+    conn = sqlite3.connect(legacy)
+    # 交付凭证特性之前的旧 SCHEMA：无 delivery_tickets 相关表
+    conn.executescript(
+        """
+        CREATE TABLE sessions (
+            id TEXT PRIMARY KEY, total_chunks INTEGER NOT NULL,
+            file_digest TEXT NOT NULL, digest_algorithm TEXT NOT NULL DEFAULT 'sha256',
+            status TEXT NOT NULL DEFAULT 'active', max_active_leases INTEGER,
+            base_retry_seconds INTEGER NOT NULL DEFAULT 5,
+            max_retry_seconds INTEGER NOT NULL DEFAULT 300,
+            revision INTEGER NOT NULL DEFAULT 0,
+            source_session_id TEXT,
+            created_at TEXT NOT NULL, finalized_at TEXT
+        );
+        CREATE TABLE chunks (
+            session_id TEXT NOT NULL, chunk_index INTEGER NOT NULL,
+            status TEXT NOT NULL DEFAULT 'pending', lease_token TEXT,
+            lease_expires_at TEXT, chunk_digest TEXT, completed_at TEXT,
+            failure_count INTEGER NOT NULL DEFAULT 0, backoff_until TEXT,
+            PRIMARY KEY (session_id, chunk_index)
+        );
+        """
+    )
+    conn.commit()
+    conn.close()
+
+    import app.db as db
+
+    migrated = sqlite3.connect(legacy)
+    db.run_migrations(migrated)
+    tables = {r[0] for r in migrated.execute(
+        "SELECT name FROM sqlite_master WHERE type = 'table'").fetchall()}
+    assert "delivery_tickets" in tables
+    assert "delivery_ticket_redemptions" in tables
+
+    ticket_cols = {r[1] for r in migrated.execute(
+        "PRAGMA table_info(delivery_tickets)").fetchall()}
+    assert ticket_cols == {"token_hash", "session_id", "expires_at", "status"}
+    redemption_cols = {r[1] for r in migrated.execute(
+        "PRAGMA table_info(delivery_ticket_redemptions)").fetchall()}
+    assert redemption_cols == {"token_hash", "request_id", "response_json", "created_at"}
+
+    # 新表可正常写入与按状态消费
+    migrated.execute(
+        "INSERT INTO sessions (id, total_chunks, file_digest, digest_algorithm, status,"
+        " created_at, finalized_at) VALUES"
+        " ('fin-sid', 1, 'dig', 'sha256', 'finalized',"
+        " '2026-01-01T00:00:00+00:00', '2026-01-02T00:00:00+00:00')"
+    )
+    migrated.execute(
+        "INSERT INTO delivery_tickets (token_hash, session_id, expires_at, status)"
+        " VALUES ('abc', 'fin-sid', '2999-01-01T00:00:00+00:00', 'active')"
+    )
+    migrated.commit()
+    cur = migrated.execute(
+        "UPDATE delivery_tickets SET status = 'consumed'"
+        " WHERE token_hash = 'abc' AND status = 'active'"
+    )
+    assert cur.rowcount == 1
+    migrated.commit()
+
+    db.run_migrations(migrated)  # 再次执行幂等不报错
+    migrated.close()

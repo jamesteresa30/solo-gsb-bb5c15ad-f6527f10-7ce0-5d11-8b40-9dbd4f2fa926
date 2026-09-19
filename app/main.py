@@ -15,6 +15,12 @@
 - 提交会话：仅当全部分片完成，返回按序分片清单，否则列出缺失分片；
   会话使用 sha256-merkle-v1 时先按分片序号构建 Merkle 树并与 file_digest
   常量时间比较，不匹配返回 409 及 computed_digest、会话保持 active
+- 交付凭证（delivery ticket）：为已 finalized 会话签发一次性清单领取凭证，
+  POST /sessions/{id}/delivery-tickets 接受 expires_in_seconds，返回仅展示一次的
+  随机 token（库内只存其 SHA-256、会话、到期时间与状态）；POST /delivery-tickets/redeem
+  接受 token 与 request_id，在同一写事务内校验未过期、未撤销、未消费后返回按序 manifest，
+  并发的不同 request_id 只有一个成功，同一 request_id 重放返回首次相同结果；
+  POST /delivery-tickets/revoke 撤销凭证，已消费凭证不可撤销、已撤销/已消费凭证不可领取
 - 进度分支（fork）：POST /sessions/{id}/fork 携带 expected_revision、幂等 request_id
   与 reuse_chunks，仅可从 active 会话创建新会话；复用分片必须全部已完成且包含其全部
   传递前置分片，否则返回 409 及缺失项且不落库；新会话复制会话配置与依赖图，复用分片
@@ -56,6 +62,7 @@ from .schemas import (
     CompleteRequest,
     CompleteResponse,
     CoolingChunk,
+    CreateDeliveryTicketRequest,
     CreateSessionRequest,
     DISPATCH_REASON_BACKOFF,
     DISPATCH_REASON_BLOCKED,
@@ -64,6 +71,7 @@ from .schemas import (
     DISPATCH_REASON_SESSION_FINALIZED,
     DISPATCH_REASON_SESSION_FULL,
     DISPATCH_REASON_SESSION_NOT_FOUND,
+    DeliveryTicketResponse,
     DispatchGrant,
     DispatchLeaseRequest,
     DispatchLeaseResponse,
@@ -77,11 +85,18 @@ from .schemas import (
     LeaseResponse,
     ManifestEntry,
     ReadyResponse,
+    RedeemDeliveryTicketRequest,
+    RedeemDeliveryTicketResponse,
     ReopenAffectedChunk,
     ReopenRequest,
     ReopenResponse,
+    RevokeDeliveryTicketRequest,
+    RevokeDeliveryTicketResponse,
     SessionResponse,
     SessionStatusResponse,
+    TICKET_STATUS_ACTIVE,
+    TICKET_STATUS_CONSUMED,
+    TICKET_STATUS_REVOKED,
     is_valid_merkle_digest,
 )
 
@@ -1268,6 +1283,202 @@ def finalize_session(session_id: str):
             for r in rows
         ],
         finalized_at=finalized_at,
+    )
+
+
+# ---------------------------------------------------------------- 交付凭证
+
+def hash_ticket_token(token: str) -> str:
+    """凭证令牌不落库：仅保存其 SHA-256 十六进制摘要。"""
+    return hashlib.sha256(token.encode("utf-8")).hexdigest()
+
+
+def build_session_manifest(session, rows) -> tuple[list[ManifestEntry], datetime]:
+    """临界区内调用：由会话行与按序分片行组装（按序清单, 提交时间）。"""
+    manifest = [
+        ManifestEntry(
+            chunk_index=r["chunk_index"],
+            chunk_digest=r["chunk_digest"],
+            completed_at=parse_ts(r["completed_at"]),
+        )
+        for r in rows
+    ]
+    return manifest, parse_ts(session["finalized_at"])
+
+
+@app.post(
+    "/sessions/{session_id}/delivery-tickets",
+    response_model=DeliveryTicketResponse,
+    status_code=201,
+    tags=["delivery-tickets"],
+    summary="为已提交会话签发一次性清单领取凭证",
+    responses={
+        404: {"description": "会话不存在"},
+        409: {"description": "会话尚未 finalized，不能签发交付凭证"},
+    },
+)
+def create_delivery_ticket(session_id: str, req: CreateDeliveryTicketRequest):
+    """生成高强度随机令牌（secrets.token_urlsafe(32)），明文仅在本响应返回一次；
+    库内只插入令牌的 SHA-256、所属会话、到期时间与 active 状态。仅 finalized 会话可签发；
+    同一会话可签发多张相互独立的凭证（分别一次性兑换、可分别撤销）。"""
+    now = utcnow()
+    with DB_LOCK:
+        session = get_session_or_404(session_id)
+        if session["status"] != "finalized":
+            raise HTTPException(
+                status_code=409,
+                detail="delivery tickets can only be issued for finalized sessions",
+            )
+        token = secrets.token_urlsafe(32)
+        token_hash = hash_ticket_token(token)
+        expires_at = now + timedelta(seconds=req.expires_in_seconds)
+        get_conn().execute(
+            "INSERT INTO delivery_tickets (token_hash, session_id, expires_at, status)"
+            " VALUES (?, ?, ?, 'active')",
+            (token_hash, session_id, expires_at.isoformat()),
+        )
+        get_conn().commit()
+
+    return DeliveryTicketResponse(
+        ticket_token=token,
+        session_id=session_id,
+        status=TICKET_STATUS_ACTIVE,
+        expires_at=expires_at,
+        created_at=now,
+    )
+
+
+@app.post(
+    "/delivery-tickets/redeem",
+    response_model=RedeemDeliveryTicketResponse,
+    tags=["delivery-tickets"],
+    summary="凭一次性凭证与幂等 request_id 兑换已提交会话的按序清单",
+    responses={
+        200: {"description": "首次兑换成功；同一 request_id 重放也返回 200 与首次相同结果"},
+        404: {"description": "令牌不存在（未知凭证）"},
+        409: {"description": "凭证已消费（不同 request_id）、已撤销或已过期"},
+    },
+)
+def redeem_delivery_ticket(req: RedeemDeliveryTicketRequest):
+    """在同一 DB_LOCK 写事务内：定位凭证 → 优先处理 (凭证, request_id) 幂等重放，
+    原样返回首次结果 → 校验状态（未消费、未撤销、未过期）→ 条件 UPDATE 将 active 凭证
+    原子置为 consumed（仅影响一行才算成功）→ 插入幂等记录保存首次完整响应 JSON。
+
+    并发的不同 request_id 经同一写锁串行化：恰好一个条件 UPDATE 命中，其余得到 409；
+    同一 request_id 的并发/重试请求均读到首次幂等记录并返回相同内容。
+    校验顺序：已消费 → 已撤销 → 已过期（过期不自动改状态，保持可撤销）。
+    """
+    now = utcnow()
+    token_hash = hash_ticket_token(req.token)
+    with DB_LOCK:
+        conn = get_conn()
+        ticket = conn.execute(
+            "SELECT * FROM delivery_tickets WHERE token_hash = ?", (token_hash,)
+        ).fetchone()
+        if ticket is None:
+            raise HTTPException(status_code=404, detail="delivery ticket not found")
+
+        # 幂等优先：同一（凭证, request_id）的重放原样返回首次结果，
+        # 即使凭证此后已被其它 request_id 消费、已撤销或已过期
+        existing = conn.execute(
+            "SELECT response_json FROM delivery_ticket_redemptions"
+            " WHERE token_hash = ? AND request_id = ?",
+            (token_hash, req.request_id),
+        ).fetchone()
+        if existing is not None:
+            return JSONResponse(status_code=200, content=json.loads(existing["response_json"]))
+
+        if ticket["status"] == TICKET_STATUS_CONSUMED:
+            raise HTTPException(
+                status_code=409, detail="delivery ticket already consumed")
+        if ticket["status"] == TICKET_STATUS_REVOKED:
+            raise HTTPException(status_code=409, detail="delivery ticket revoked")
+        if parse_ts(ticket["expires_at"]) <= now:
+            raise HTTPException(status_code=409, detail="delivery ticket expired")
+
+        session = conn.execute(
+            "SELECT * FROM sessions WHERE id = ?", (ticket["session_id"],)
+        ).fetchone()
+        rows = conn.execute(
+            "SELECT * FROM chunks WHERE session_id = ? ORDER BY chunk_index",
+            (ticket["session_id"],),
+        ).fetchall()
+
+        manifest, finalized_at = build_session_manifest(session, rows)
+        result = RedeemDeliveryTicketResponse(
+            session_id=session["id"],
+            status="finalized",
+            file_digest=session["file_digest"],
+            digest_algorithm=session["digest_algorithm"],
+            total_chunks=session["total_chunks"],
+            manifest=manifest,
+            finalized_at=finalized_at,
+            redeemed_at=now,
+            request_id=req.request_id,
+        )
+        payload = result.model_dump(mode="json")
+
+        # 原子消费：仅 active 凭证可被置为 consumed；并发不同 request_id 至多一个命中
+        cur = conn.execute(
+            "UPDATE delivery_tickets SET status = 'consumed'"
+            " WHERE token_hash = ? AND status = 'active'",
+            (token_hash,),
+        )
+        if cur.rowcount != 1:
+            # 临界区内被并发请求抢先消费（理论上写锁串行化不会发生，防御性处理）
+            raise HTTPException(
+                status_code=409, detail="delivery ticket already consumed")
+        conn.execute(
+            "INSERT INTO delivery_ticket_redemptions"
+            " (token_hash, request_id, response_json, created_at)"
+            " VALUES (?, ?, ?, ?)",
+            (token_hash, req.request_id, json.dumps(payload), now.isoformat()),
+        )
+        conn.commit()
+
+    return result
+
+
+@app.post(
+    "/delivery-tickets/revoke",
+    response_model=RevokeDeliveryTicketResponse,
+    tags=["delivery-tickets"],
+    summary="撤销未消费的交付凭证（已消费凭证不可撤销）",
+    responses={
+        404: {"description": "令牌不存在（未知凭证）"},
+        409: {"description": "凭证已消费，不可撤销"},
+    },
+)
+def revoke_delivery_ticket(req: RevokeDeliveryTicketRequest):
+    """在同一写事务内将未消费凭证置为 revoked：active 未消费凭证（含已过期但尚未消费的）
+    可撤销；已撤销凭证重复撤销幂等返回；已消费凭证不可撤销（409）。
+    撤销后任何兑换请求（含从未用过的 request_id）都得到 409。"""
+    now = utcnow()
+    with DB_LOCK:
+        conn = get_conn()
+        ticket = conn.execute(
+            "SELECT * FROM delivery_tickets WHERE token_hash = ?",
+            (hash_ticket_token(req.token),),
+        ).fetchone()
+        if ticket is None:
+            raise HTTPException(status_code=404, detail="delivery ticket not found")
+        if ticket["status"] == TICKET_STATUS_CONSUMED:
+            raise HTTPException(
+                status_code=409, detail="consumed delivery ticket cannot be revoked")
+
+        already_revoked = ticket["status"] == TICKET_STATUS_REVOKED
+        if not already_revoked:
+            conn.execute(
+                "UPDATE delivery_tickets SET status = 'revoked' WHERE token_hash = ?",
+                (ticket["token_hash"],),
+            )
+            conn.commit()
+
+    return RevokeDeliveryTicketResponse(
+        session_id=ticket["session_id"],
+        status=TICKET_STATUS_REVOKED,
+        revoked_at=now,
+        already_revoked=already_revoked,
     )
 
 

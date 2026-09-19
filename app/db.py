@@ -73,6 +73,28 @@ CREATE TABLE IF NOT EXISTS chunk_dependencies (
 );
 
 CREATE INDEX IF NOT EXISTS idx_chunk_deps_session ON chunk_dependencies(session_id);
+
+-- 交付凭证（delivery ticket）：为已 finalized 会话签发的一次性清单领取凭证。
+-- 明文随机令牌只在签发响应中返回一次，库内仅保存其 SHA-256（兼作主键）、
+-- 所属会话、到期时间与状态：active（未消费）| consumed（已消费）| revoked（已撤销）
+CREATE TABLE IF NOT EXISTS delivery_tickets (
+    token_hash  TEXT PRIMARY KEY,                          -- 令牌的 SHA-256（64 位小写十六进制）
+    session_id  TEXT NOT NULL REFERENCES sessions(id),
+    expires_at  TEXT NOT NULL,
+    status      TEXT NOT NULL DEFAULT 'active'
+);
+
+CREATE INDEX IF NOT EXISTS idx_delivery_tickets_session ON delivery_tickets(session_id);
+
+-- 交付凭证兑换幂等记录：(凭证, request_id) 唯一；保存首次成功兑换的完整响应 JSON，
+-- 同一 request_id 重放时原样返回首次结果（即使凭证此后已过期/被撤销）
+CREATE TABLE IF NOT EXISTS delivery_ticket_redemptions (
+    token_hash    TEXT NOT NULL REFERENCES delivery_tickets(token_hash),
+    request_id    TEXT NOT NULL,
+    response_json TEXT NOT NULL,                           -- 首次兑换响应的 JSON（原样重放）
+    created_at    TEXT NOT NULL,
+    PRIMARY KEY (token_hash, request_id)
+);
 """
 
 # 增量迁移：针对早于当前 SCHEMA 创建的旧库，幂等执行（CREATE TABLE IF NOT EXISTS
@@ -145,6 +167,33 @@ CREATE TABLE dispatch_cursors (
     queue_key        TEXT PRIMARY KEY,
     last_session_id  TEXT NOT NULL,
     updated_at       TEXT NOT NULL
+)
+        """,
+    ),
+    # 0008: 交付凭证表；旧库直接按当前定义新建，仅保存令牌哈希、会话、到期时间与状态
+    (
+        "table",
+        "delivery_tickets",
+        """
+CREATE TABLE delivery_tickets (
+    token_hash  TEXT PRIMARY KEY,
+    session_id  TEXT NOT NULL REFERENCES sessions(id),
+    expires_at  TEXT NOT NULL,
+    status      TEXT NOT NULL DEFAULT 'active'
+)
+        """,
+    ),
+    # 0009: 交付凭证兑换幂等记录表；保存首次成功兑换响应，重放原样返回
+    (
+        "table",
+        "delivery_ticket_redemptions",
+        """
+CREATE TABLE delivery_ticket_redemptions (
+    token_hash    TEXT NOT NULL REFERENCES delivery_tickets(token_hash),
+    request_id    TEXT NOT NULL,
+    response_json TEXT NOT NULL,
+    created_at    TEXT NOT NULL,
+    PRIMARY KEY (token_hash, request_id)
 )
         """,
     ),

@@ -383,6 +383,69 @@ class FinalizeResponse(BaseModel):
     finalized_at: datetime
 
 
+# ---------------------------------------------------------------- 交付凭证（delivery ticket）
+
+# 凭证状态机：active（未消费、未撤销）| consumed（已兑换，恰好一次）| revoked（已撤销）
+TICKET_STATUS_ACTIVE = "active"
+TICKET_STATUS_CONSUMED = "consumed"
+TICKET_STATUS_REVOKED = "revoked"
+
+
+class CreateDeliveryTicketRequest(BaseModel):
+    expires_in_seconds: int = Field(
+        ge=1, le=86_400 * 365,
+        description="凭证有效期（秒）：自签发时刻起算，到期后不可再兑换")
+
+
+class DeliveryTicketResponse(BaseModel):
+    ticket_token: str = Field(
+        description="一次性随机领取令牌，仅此响应返回一次；库内只保存其 SHA-256，"
+                    "遗失或泄露后无法找回，只能重新签发或撤销旧凭证")
+    session_id: str = Field(description="凭证绑定的已提交会话 id")
+    status: str = Field(description="凭证状态：active（未消费、未撤销）")
+    expires_at: datetime = Field(description="凭证到期时间（UTC），此后兑换被拒绝")
+    created_at: datetime
+
+
+class RedeemDeliveryTicketRequest(BaseModel):
+    token: str = Field(
+        min_length=1, max_length=512,
+        description="签发接口仅返回一次的随机领取令牌；服务端按其 SHA-256 查凭证")
+    request_id: str = Field(
+        min_length=1, max_length=128,
+        description="兑换幂等键：同一凭证 + 同一 request_id 的重放返回首次兑换结果；"
+                    "凭证只能被一个 request_id 成功兑换，不同 request_id 的并发请求只有一个成功")
+
+
+class RedeemDeliveryTicketResponse(BaseModel):
+    session_id: str
+    status: str = Field(description="会话状态：始终为 finalized")
+    file_digest: str
+    digest_algorithm: str
+    total_chunks: int
+    manifest: list[ManifestEntry] = Field(description="按分片序号升序的分片清单")
+    finalized_at: datetime
+    redeemed_at: datetime = Field(description="首次成功兑换的时间（重放保持首次值）")
+    request_id: str = Field(description="本次兑换使用的幂等键")
+
+
+class RevokeDeliveryTicketRequest(BaseModel):
+    token: str = Field(
+        min_length=1, max_length=512,
+        description="要撤销的凭证令牌（签发接口仅返回一次的明文）；服务端按其 SHA-256 定位")
+
+
+class RevokeDeliveryTicketResponse(BaseModel):
+    session_id: str
+    status: str = Field(
+        description="撤销后的凭证状态：revoked；对已撤销凭证重复撤销保持 revoked（幂等）")
+    revoked_at: datetime = Field(
+        description="本次撤销操作的服务端时间；凭证首次撤销时即状态变为 revoked 的时间"
+                    "（库内仅保存凭证状态，重复撤销时为本次调用时间，以 already_revoked 为准）")
+    already_revoked: bool = Field(
+        default=False, description="凭证此前是否已处于 revoked 状态（重复撤销为 true）")
+
+
 class ChunkStatus(BaseModel):
     chunk_index: int
     status: str  # pending | leased | completed（过期租约/冷却中的分片按 pending 展示）
